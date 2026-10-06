@@ -938,6 +938,41 @@ def _is_email_login_page_still_present(driver) -> bool:
     return bool(state.get("inputs"))
 
 
+def _is_authorize_reset_page(driver) -> bool:
+    """当前是否被 OpenAI 重置回 OAuth 授权入口页（/api/accounts/authorize）。
+
+    提交邮箱后若停在 `/api/accounts/authorize?...` 且页面没有任何可交互输入框，
+    说明 OpenAI 把流程打回了起点——这是「出口 IP 被限流/风控」的**静默**表现
+    （另一种表现是 /auth/error 的显式错误页）。
+
+    必须在等待循环里单独识别它：否则该页会被归类为 unknown，上层继续走
+    「重填邮箱」分支，最终抛出 `找不到邮箱输入框` —— 一个把风控伪装成
+    选择器缺陷的误导性报错，排查时极易误判为代码 bug。
+    """
+    try:
+        url = str(driver.current_url or "")
+    except Exception:
+        return False
+    if "/api/accounts/authorize" not in url:
+        return False
+    # 该入口页不应带登录/注册表单；若反而有输入框，说明是正常页面的其它阶段，不误判。
+    try:
+        if _email_input_value_state(driver).get("inputs"):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _blocked_ip_error(url: str) -> RuntimeError:
+    """构造「出口 IP 被限流/风控」的标准错误，供各调用点统一抛出。"""
+    return RuntimeError(
+        "邮箱提交后被 OpenAI 重置回授权入口，疑似出口 IP 被限流/风控（未返回明确错误页）。"
+        "这不是页面选择器缺陷。建议更换代理节点（不同地区）或稍后重试；"
+        f"url={url or ''}"
+    )
+
+
 def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
     """邮箱提交后等待进入 password / otp / logged_in；仍停留邮箱页则返回 email_page。
 
@@ -963,6 +998,8 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
             return "otp"
         if _is_signup_password_page(driver):
             return "password"
+        if _is_authorize_reset_page(driver):
+            return "blocked"
         state = _email_input_value_state(driver)
         last = state
         inputs = state.get("inputs") or []
@@ -1036,6 +1073,8 @@ def _submit_email_and_wait_next(driver, email: str, attempts: int = 3) -> str:
             if probe in ("password", "otp", "logged_in"):
                 logger.info("%s 重试前重新判定，页面实际已进入下一步：%s", _log_prefix(driver), probe)
                 return probe
+            if probe == "blocked":
+                raise _blocked_ip_error(getattr(driver, "current_url", "") or "")
         _type_email_address(driver, email, timeout=20)
         state = _email_input_value_state(driver)
         last_state = state
@@ -1054,6 +1093,8 @@ def _submit_email_and_wait_next(driver, email: str, attempts: int = 3) -> str:
         if state_name in ("password", "otp", "logged_in"):
             logger.info("%s 邮箱提交后已进入下一步：%s", _log_prefix(driver), state_name)
             return state_name
+        if state_name == "blocked":
+            raise _blocked_ip_error(getattr(driver, "current_url", "") or "")
         logger.warning("%s 邮箱提交后仍未进入下一步：%s，准备重填重试 state=%s", _log_prefix(driver), state_name, _email_input_value_state(driver))
         time.sleep(1.0)
     raise RuntimeError(f"邮箱提交后未进入密码页/验证码页，最后状态={last_state}")

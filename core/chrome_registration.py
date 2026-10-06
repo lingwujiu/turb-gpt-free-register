@@ -340,18 +340,20 @@ def run_chrome_registration(
             "error": None if codex_ok else f"Codex 未完成: {codex_result.get('message')}",
         }
     except Exception as exc:
-        # 先判断是否停在 OpenAI 的 auth 错误页：这类失败与代码无关，
-        # 多为同一出口 IP 短时间注册过多被限流，给出明确提示避免误判。
+        # 先判断是否停在 OpenAI 的风控页面：这类失败与代码无关，
+        # 多为出口 IP 被限流/标记，给出明确提示避免误判为选择器缺陷。
+        # 两种表现：① /auth/error 显式错误页 ② 被静默重置回 /api/accounts/authorize。
         try:
             _final_url = str(driver.current_url or "") if driver else ""
         except Exception:
             _final_url = ""
-        if "auth/error" in _final_url:
-            _tip = (
-                "同一出口 IP 短时间注册过多触发 OpenAI 限流"
-                if "error=undefined" in _final_url
-                else "OpenAI 返回 auth 错误页（可能为限流或服务端拦截）"
-            )
+        if "auth/error" in _final_url or "/api/accounts/authorize" in _final_url:
+            if "/api/accounts/authorize" in _final_url and "auth/error" not in _final_url:
+                _tip = "页面被重置回 OAuth 授权入口（未返回明确错误页）"
+            elif "error=undefined" in _final_url:
+                _tip = "同一出口 IP 短时间注册过多触发 OpenAI 限流"
+            else:
+                _tip = "OpenAI 返回 auth 错误页（可能为限流或服务端拦截）"
             logger.error(
                 "[Chrome注册] 本次注册被 OpenAI 拒绝：%s。当前出口 IP 已受限，"
                 "建议更换代理节点（不同地区）或等待 20~30 分钟冷却后重试。url=%s",
