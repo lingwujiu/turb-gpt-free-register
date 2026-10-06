@@ -964,12 +964,40 @@ def _is_authorize_reset_page(driver) -> bool:
     return True
 
 
-def _blocked_ip_error(url: str) -> RuntimeError:
+# 命中 Cloudflare 挑战页时可额外等待的秒数（在原有提交等待窗之上延长）。
+# 挑战是暂时性的、有放行可能，值得多等；而真正的风控重置不会自行恢复。
+_CF_CHALLENGE_GRACE = 60.0
+
+
+def _is_cloudflare_challenge(driver) -> bool:
+    """当前页面是否是 Cloudflare「Just a moment...」挑战页。
+
+    挑战页的 URL 可能仍是 `/api/accounts/authorize`（CF 拦在域名之前，不改 URL），
+    因此必须靠标题区分。2026-10-06 job 189 即提交邮箱后撞上挑战页，原 20 秒窗口
+    内无人等它放行，被当成「风控重置」直接判死。
+    """
+    try:
+        title = str(driver.execute_script("return document.title || ''") or "")
+    except Exception:
+        return False
+    low = title.lower()
+    return (
+        "just a moment" in low
+        or "attention required" in low
+        or "checking your browser" in low
+    )
+
+
+def _blocked_ip_error(driver) -> RuntimeError:
     """构造「出口 IP 被限流/风控」的标准错误，供各调用点统一抛出。"""
+    try:
+        url = str(driver.current_url or "")
+    except Exception:
+        url = ""
     return RuntimeError(
-        "邮箱提交后被 OpenAI 重置回授权入口，疑似出口 IP 被限流/风控（未返回明确错误页）。"
-        "这不是页面选择器缺陷。建议更换代理节点（不同地区）或稍后重试；"
-        f"url={url or ''}"
+        "邮箱提交后被 OpenAI 拦截回授权入口，疑似出口 IP 被限流/风控（未返回明确错误页）。"
+        "这不是页面选择器缺陷。建议更换代理节点（不同地区）后重试；"
+        f"url={url}"
     )
 
 
@@ -988,6 +1016,7 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
     cleared_seen_at: float | None = None
     cleared_last_log_at = 0.0
     cleared_recover_done = False
+    cf_challenge_until: float | None = None
     expected_email = str(email or "").strip().lower()
     while time.time() < end:
         if _has_access_token(driver):
@@ -999,6 +1028,22 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
         if _is_signup_password_page(driver):
             return "password"
         if _is_authorize_reset_page(driver):
+            # 挑战页与风控重置的 URL 相同，靠标题区分：挑战会自行放行，值得多等；
+            # 真·重置不会恢复，直接上报，避免白白耗完整窗。
+            if _is_cloudflare_challenge(driver):
+                if cf_challenge_until is None:
+                    cf_challenge_until = time.time() + _CF_CHALLENGE_GRACE
+                    # 留 1 秒余量：若把 end 直接设成 cf_challenge_until，时间一到
+                    # `while time < end` 会先不成立、直接掉出循环返回 unknown，
+                    # 而不是把 blocked 老实报上去。
+                    end = max(end, cf_challenge_until + 1.0)
+                    logger.info(
+                        "%s 邮箱提交后遇到 Cloudflare 挑战页，延长等待自动放行（最多 %.0f 秒）…",
+                        _log_prefix(driver), _CF_CHALLENGE_GRACE,
+                    )
+                if time.time() < cf_challenge_until:
+                    time.sleep(1.0)
+                    continue
             return "blocked"
         state = _email_input_value_state(driver)
         last = state
@@ -1074,7 +1119,7 @@ def _submit_email_and_wait_next(driver, email: str, attempts: int = 3) -> str:
                 logger.info("%s 重试前重新判定，页面实际已进入下一步：%s", _log_prefix(driver), probe)
                 return probe
             if probe == "blocked":
-                raise _blocked_ip_error(getattr(driver, "current_url", "") or "")
+                raise _blocked_ip_error(driver)
         _type_email_address(driver, email, timeout=20)
         state = _email_input_value_state(driver)
         last_state = state
@@ -1094,7 +1139,7 @@ def _submit_email_and_wait_next(driver, email: str, attempts: int = 3) -> str:
             logger.info("%s 邮箱提交后已进入下一步：%s", _log_prefix(driver), state_name)
             return state_name
         if state_name == "blocked":
-            raise _blocked_ip_error(getattr(driver, "current_url", "") or "")
+            raise _blocked_ip_error(driver)
         logger.warning("%s 邮箱提交后仍未进入下一步：%s，准备重填重试 state=%s", _log_prefix(driver), state_name, _email_input_value_state(driver))
         time.sleep(1.0)
     raise RuntimeError(f"邮箱提交后未进入密码页/验证码页，最后状态={last_state}")

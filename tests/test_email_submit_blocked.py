@@ -15,6 +15,7 @@ job 189 提交邮箱后，页面被静默重置回 `/api/accounts/authorize`（O
   ① /auth/error?error=...  显式错误页（旧代码已覆盖）
   ② /api/accounts/authorize 静默重置（本模块负责）
 """
+import time
 import unittest
 from unittest.mock import patch
 
@@ -22,10 +23,14 @@ from core import roxy_registration as rr
 
 
 class _Driver:
-    """只提供 current_url 的最小 driver 替身。"""
+    """最小 driver 替身：需要 current_url，并给出返回标题的 execute_script。"""
 
-    def __init__(self, url):
+    def __init__(self, url, title=""):
         self.current_url = url
+        self._title = title
+
+    def execute_script(self, _script):
+        return self._title
 
 
 class AuthorizeResetPageTests(unittest.TestCase):
@@ -62,7 +67,8 @@ class WaitEmailSubmitNextStateBlockedTests(unittest.TestCase):
              patch.object(rr, "_is_login_password_page", return_value=False), \
              patch.object(rr, "_is_email_verification_page", return_value=False), \
              patch.object(rr, "_is_signup_password_page", return_value=False), \
-             patch.object(rr, "_is_authorize_reset_page", return_value=True):
+             patch.object(rr, "_is_authorize_reset_page", return_value=True), \
+             patch.object(rr, "_is_cloudflare_challenge", return_value=False):
             self.assertEqual(
                 rr._wait_email_submit_next_state(driver, "a@b.c", timeout=1),
                 "blocked",
@@ -82,6 +88,72 @@ class WaitEmailSubmitNextStateBlockedTests(unittest.TestCase):
                 rr._wait_email_submit_next_state(driver, "a@b.c", timeout=1),
                 "unknown",
             )
+
+
+class IsCloudflareChallengeTests(unittest.TestCase):
+    def test_title_matching(self):
+        self.assertTrue(rr._is_cloudflare_challenge(_Driver("u", title="Just a moment...")))
+        self.assertTrue(rr._is_cloudflare_challenge(_Driver("u", title="Attention Required! | Cloudflare")))
+        self.assertTrue(rr._is_cloudflare_challenge(_Driver("u", title="Checking your browser before accessing")))
+        self.assertFalse(rr._is_cloudflare_challenge(_Driver("u", title="ChatGPT")))
+
+    def test_execute_script_failure_is_not_challenge(self):
+        class _Bad:
+            current_url = "u"
+
+            def execute_script(self, _s):
+                raise RuntimeError("no js")
+
+        self.assertFalse(rr._is_cloudflare_challenge(_Bad()))
+
+
+class CloudflareChallengeGraceTests(unittest.TestCase):
+    """挑战页必须与风控重置区分：前者会自行放行，值得延长等待。"""
+
+    def _base_patches(self):
+        return [
+            patch.object(rr, "_has_access_token", return_value=False),
+            patch.object(rr, "_is_login_password_page", return_value=False),
+            patch.object(rr, "_is_signup_password_page", return_value=False),
+        ]
+
+    def test_challenge_without_clearance_waits_then_blocks(self):
+        driver = _Driver("https://auth.openai.com/api/accounts/authorize?client_id=app_x")
+        patches = self._base_patches() + [
+            patch.object(rr, "_is_email_verification_page", return_value=False),
+            patch.object(rr, "_is_authorize_reset_page", return_value=True),
+            patch.object(rr, "_is_cloudflare_challenge", return_value=True),
+            patch.object(rr, "_CF_CHALLENGE_GRACE", 2.0),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        started = time.time()
+        result = rr._wait_email_submit_next_state(driver, "a@b.c", timeout=1)
+        elapsed = time.time() - started
+        self.assertEqual(result, "blocked")
+        # 确实延长等待过：否则 1 秒窗口就结束了。
+        self.assertGreaterEqual(elapsed, 2.0)
+
+    def test_challenge_cleared_returns_real_state(self):
+        driver = _Driver(
+            "https://auth.openai.com/api/accounts/authorize?client_id=app_x",
+            title="Just a moment...",
+        )
+        # 前两轮仍停在挑战页，第三轮已进入 OTP 页。
+        reset_seq = iter([True, True, False])
+        otp_seq = iter([False, False, True])
+        patches = self._base_patches() + [
+            patch.object(rr, "_is_email_verification_page", side_effect=lambda *a: next(otp_seq, False)),
+            patch.object(rr, "_is_authorize_reset_page", side_effect=lambda *a: next(reset_seq, False)),
+            patch.object(rr, "_is_cloudflare_challenge", return_value=True),
+            patch.object(rr, "_CF_CHALLENGE_GRACE", 30.0),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        result = rr._wait_email_submit_next_state(driver, "a@b.c", timeout=1)
+        self.assertEqual(result, "otp")
 
 
 class SubmitEmailRaisesBlockedTests(unittest.TestCase):
