@@ -1412,7 +1412,8 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
         )
     except Exception as exc:
         logger.error("[Codex][BrowserUse] 授权失败：%s: %s", type(exc).__name__, exc)
-        logger.debug("[Codex][BrowserUse] 失败详情", exc_info=True)
+        # warning 而非 debug：job 日志 handler 级别为 INFO，debug 会被丢弃（见 chrome_registration 同处注释）。
+        logger.warning("[Codex][BrowserUse] 失败详情（完整堆栈）", exc_info=True)
         return proto._codex_result(status="failed", email=email, message=f"{type(exc).__name__}: {str(exc)[:300]}")
     finally:
         keep_open = bool(getattr(_cfg, "BROWSER_USE_KEEP_BROWSER_OPEN", False))

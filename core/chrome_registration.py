@@ -358,7 +358,10 @@ def run_chrome_registration(
                 _tip, _final_url[:120],
             )
         logger.error("[Chrome注册] 失败：%s: %s", type(exc).__name__, exc)
-        logger.debug("[Chrome注册] 失败详情", exc_info=True)
+        # 用 warning 而不是 debug：job 日志的 handler 级别是 INFO，debug 会被直接丢弃，
+        # 导致任务日志里只剩一行异常 str、看不到堆栈，排查时极易误判根因（例如
+        # 环境变量导致的 driver 崩溃只暴露成 AttributeError）。
+        logger.warning("[Chrome注册] 失败详情（完整堆栈）", exc_info=True)
         try:
             from core.email_provider import release_email
 

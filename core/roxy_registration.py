@@ -2244,7 +2244,8 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
         }
     except Exception as exc:
         logger.error("[Roxy注册] 失败：%s: %s", type(exc).__name__, exc)
-        logger.debug("[Roxy注册] 失败详情", exc_info=True)
+        # warning 而非 debug：job 日志 handler 级别为 INFO，debug 会被丢弃（见 chrome_registration 同处注释）。
+        logger.warning("[Roxy注册] 失败详情（完整堆栈）", exc_info=True)
         # 未确认创建前回收邮箱；确认后避免重复使用。
         try:
             from core.email_provider import release_email

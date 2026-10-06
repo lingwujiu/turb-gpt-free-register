@@ -1940,7 +1940,8 @@ def run_browser_use_registration(
             }
     except Exception as exc:
         logger.error("[BrowserUse] 注册失败：%s: %s", type(exc).__name__, exc)
-        logger.debug("[BrowserUse] 失败详情", exc_info=True)
+        # warning 而非 debug：job 日志 handler 级别为 INFO，debug 会被丢弃（见 chrome_registration 同处注释）。
+        logger.warning("[BrowserUse] 失败详情（完整堆栈）", exc_info=True)
         try:
             from core.email_provider import release_email
             release_email(

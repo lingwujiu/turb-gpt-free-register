@@ -1411,7 +1411,8 @@ def _run_roxy_codex_oauth_once(
         )
     except Exception as exc:
         logger.warning("[Codex][Browser] 失败：%s，%s: %s", email, type(exc).__name__, str(exc)[:240])
-        logger.debug("[Codex][Browser] 失败详情", exc_info=True)
+        # warning 而非 debug：job 日志 handler 级别为 INFO，debug 会被丢弃（见 chrome_registration 同处注释）。
+        logger.warning("[Codex][Browser] 失败详情（完整堆栈）", exc_info=True)
         return proto._codex_result(status="failed", email=email, message=f"{type(exc).__name__}: {str(exc)[:220]}")
     finally:
         # 注册后复用窗口时，driver/profile 生命周期由注册流程统一清理，

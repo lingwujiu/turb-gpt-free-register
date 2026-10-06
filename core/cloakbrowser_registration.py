@@ -158,7 +158,8 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
         return {"success": bool(codex_ok), "email": email, "account_id": account_id, "access_token": access_token, "totp_secret": totp_secret, "codex": codex_result, "error": None if codex_ok else f"Codex 未完成: {codex_result.get('message')}"}
     except Exception as exc:
         logger.error("[Cloak注册] 失败：%s: %s", type(exc).__name__, exc)
-        logger.debug("[Cloak注册] 失败详情", exc_info=True)
+        # warning 而非 debug：job 日志 handler 级别为 INFO，debug 会被丢弃（见 chrome_registration 同处注释）。
+        logger.warning("[Cloak注册] 失败详情（完整堆栈）", exc_info=True)
         try:
             from core.email_provider import release_email
             release_email(email, status="failed" if create_acknowledged else "available", note=f"Cloak注册失败: {str(exc)[:180]}")

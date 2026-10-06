@@ -1530,7 +1530,8 @@ def run_codex_oauth(
                 _cpa_reauth_round=_cpa_reauth_round + 1,
             )
         logger.warning(f"[Codex] 失败：{email}，{type(exc).__name__}: {str(exc)[:200]}")
-        logger.debug("[Codex] 失败详情:", exc_info=True)
+        # warning 而非 debug：job 日志 handler 级别为 INFO，debug 会被丢弃（见 chrome_registration 同处注释）。
+        logger.warning("[Codex] 失败详情（完整堆栈）", exc_info=True)
         return _codex_result(
             status="failed",
             email=email,
