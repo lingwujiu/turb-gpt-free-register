@@ -1271,6 +1271,17 @@ def _click_resend_email_otp(driver, timeout: int = 20) -> dict:
     raise RuntimeError(f"找不到可点击的重新发送验证码按钮: last={last}, state={_email_otp_page_state(driver)}")
 
 
+def _title_indicates_email_verified(state: dict) -> bool:
+    """页面标题是否已表明邮箱验证通过。
+
+    OTP 校验成功后，OpenAI 的 SPA 有时**不换 URL**（仍停在 /email-verification），
+    只把 document.title 改成 "Email verified - OpenAI"。仅凭 URL 判定会把这种
+    「其实已成功」误判成 stuck，于是重载重提、再升级为「重发换码」；而页面此时
+    早已没有重发按钮，最终抛「找不到可点击的重新发送验证码按钮」（job 193）。
+    """
+    return 'email verified' in str((state or {}).get('title') or '').lower()
+
+
 def _wait_after_email_otp_submit(driver, timeout: int = 30) -> str:
     """提交 OTP 后等待页面离开验证码页。返回三种状态：
 
@@ -1291,6 +1302,13 @@ def _wait_after_email_otp_submit(driver, timeout: int = 30) -> str:
         if not _is_email_verification_page(driver):
             return 'accepted'
         last = _email_otp_page_state(driver)
+        if _title_indicates_email_verified(last):
+            # SPA 没换 URL，但服务端已通过 —— 这是明确的成功信号，必须判 accepted。
+            logger.info(
+                "%s[OTP] 页面标题已表明邮箱验证通过（SPA 未跳转），判定提交成功",
+                _log_prefix(driver),
+            )
+            return 'accepted'
         invalid = any(str(i.get('ariaInvalid') or '').lower() == 'true' for i in (last.get('inputs') or []))
         if invalid or (last.get('errors') or []):
             return 'invalid'
@@ -1335,6 +1353,12 @@ def _submit_email_otp_and_settle(
             time.sleep(3)
             # 重载后先看页面是否已经前进（服务端其实已通过的情况）
             if not _is_email_verification_page(driver):
+                return 'accepted'
+            if _title_indicates_email_verified(_email_otp_page_state(driver)):
+                logger.info(
+                    "%s[OTP] 重载后标题已表明邮箱验证通过（SPA 未跳转），判定提交成功",
+                    _log_prefix(driver),
+                )
                 return 'accepted'
             try:
                 _clear_otp_inputs(driver)

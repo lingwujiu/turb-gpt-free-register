@@ -141,6 +141,27 @@ def _clear_known_error_page(driver) -> None:
     logger.warning("[Chrome注册] 当前停在 auth 错误页（疑似%s）：%s", reason, url[:120])
 
 
+def _resend_email_otp_or_accept_if_passed(driver) -> bool:
+    """点「重新发送电子邮件」换新码；若页面其实已通过验证，则返回 True。
+
+    **找不到重发按钮 ≠ 需要重发**：OTP 校验成功后 OpenAI 会把页面停在
+    /email-verification（title 变成 "Email verified"）并撤掉重发入口，
+    此时去点重发只会抛「找不到可点击的重新发送验证码按钮」，把已经成功的流程判死
+    （2026-10-06 job 193）。所以失败时先复核一次真实状态再决定。
+    """
+    try:
+        _click_resend_email_otp(driver, timeout=25)
+        return False
+    except Exception as exc:
+        if _wait_after_email_otp_submit(driver, timeout=3) == "accepted":
+            logger.info(
+                "[Chrome注册][OTP] 没有重发按钮但页面已通过邮箱验证，按成功继续：%s",
+                type(exc).__name__,
+            )
+            return True
+        raise
+
+
 def run_chrome_registration(
     email: str,
     name: str,
@@ -215,7 +236,8 @@ def run_chrome_registration(
                 "（下一轮 %s/%s）", outcome, otp_attempt + 1, max_otp_attempts,
             )
             otp_after_ts = time.time()
-            _click_resend_email_otp(driver, timeout=25)
+            if _resend_email_otp_or_accept_if_passed(driver):
+                break
             human_delay("api")
             current_otp = None
 
