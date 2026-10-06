@@ -92,6 +92,11 @@ from config.openai_protocol import (
 # ---------- 代理池 ----------
 from config.proxy import (
     PROXY_POOL,
+    ROTATING_PROXY_TEMPLATE,
+    ROTATING_PROXY_COUNTRY,
+    ROTATING_PROXY_CITY,
+    ROTATING_PROXY_SESSION_LEN,
+    ROTATING_PROXY_SESSION_TTL,
     PLAN_CHECK_PROXY_MODE,
     PLAN_CHECK_PROXY,
     PLAN_CHECK_TIMEOUT,
@@ -104,6 +109,12 @@ from config.proxy import (
     PLAN_CHECK_JITTER,
     pick_proxy,
     PROXY,
+)
+
+from config.proxy import (  # noqa: E402
+    generate_proxy_session_id,
+    build_rotating_proxy,
+    has_rotating_proxy,
 )
 
 # ---------- 注册默认信息 ----------
@@ -154,6 +165,24 @@ from config.email import (
 # ---------- 2FA ----------
 from config.twofa import ENABLE_2FA
 
+# ---------- 本机 Chrome 驱动 ----------
+from config.chrome import (
+    CHROME_HEADLESS,
+    CHROME_USE_PROXY,
+    CHROME_SELENIUM_TIMEOUT,
+    CHROME_VIEWPORT_WIDTH,
+    CHROME_VIEWPORT_HEIGHT,
+    CHROME_LOCALE,
+    CHROME_TIMEZONE,
+    CHROME_GEOIP,
+    CHROME_EXTRA_ARGS,
+    CHROME_USER_DATA_DIR,
+    CHROME_KEEP_BROWSER_OPEN,
+    CHROME_EXECUTABLE_PATH,
+    CHROME_PASSWORD_SETUP,
+    CHROME_CF_CHALLENGE_WAIT,
+)
+
 
 # ---------- 热加载支持 ----------
 # WebUI 改配置后调 reload_all() 即可让所有运行时代码看到新值，无需重启进程。
@@ -171,6 +200,7 @@ _RELOADABLE_SUBMODULES = (
     "config.twofa",
     "config.roxybrowser",
     "config.cloakbrowser",
+    "config.chrome",
     "config.browser_use",
     "config.skyvern",
     "config.flow_trigger",
@@ -207,11 +237,15 @@ def reload_all() -> list[str]:
 def _refresh_top_level_constants() -> None:
     """把刚 reload 的子模块的常量重新拷一份到 config 包顶层。"""
     import config as _self
-    from config import browser, openai_protocol, proxy as _proxy, register, email, twofa, roxybrowser, cloakbrowser, browser_use, skyvern, codex, extract_link, sub2api, humanize, flow_trigger
+    from config import browser, openai_protocol, proxy as _proxy, register, email, twofa, roxybrowser, cloakbrowser, chrome, browser_use, skyvern, codex, extract_link, sub2api, humanize, flow_trigger
     # 简单粗暴：枚举一遍重要常量，覆盖到 _self
-    for src in (browser, openai_protocol, _proxy, register, email, twofa, roxybrowser, cloakbrowser, browser_use, skyvern, codex, extract_link, sub2api, humanize, flow_trigger):
+    for src in (browser, openai_protocol, _proxy, register, email, twofa, roxybrowser, cloakbrowser, chrome, browser_use, skyvern, codex, extract_link, sub2api, humanize, flow_trigger):
         for k in dir(src):
-            if k.isupper() or k in ("pick_proxy", "pick_browser_profile", "build_browser_environment", "validate_browser_profile"):
+            if k.isupper() or k in (
+                "pick_proxy", "pick_browser_profile", "build_browser_environment",
+                "validate_browser_profile", "build_rotating_proxy", "has_rotating_proxy",
+                "generate_proxy_session_id",
+            ):
                 setattr(_self, k, getattr(src, k))
 
 
@@ -237,10 +271,14 @@ __all__ = [
     "STATSIG_CLIENT_KEY", "STATSIG_SDK_VERSION", "STATSIG_SDK_TYPE", "AB_CLIENT_KEY", "AB_SDK_VERSION",
     "SEND_SENTINEL_ON_EMAIL_OTP_VALIDATE", "CHATGPT_ANON_BOOTSTRAP_ENABLED", "CHATGPT_AUTH_BOOTSTRAP_ENABLED", "CHATGPT_BOOTSTRAP_STRICT",
     # proxy
-    "PROXY_POOL", "PLAN_CHECK_PROXY_MODE", "PLAN_CHECK_PROXY",
+    "PROXY_POOL",
+    "ROTATING_PROXY_TEMPLATE", "ROTATING_PROXY_COUNTRY", "ROTATING_PROXY_CITY",
+    "ROTATING_PROXY_SESSION_LEN", "ROTATING_PROXY_SESSION_TTL",
+    "PLAN_CHECK_PROXY_MODE", "PLAN_CHECK_PROXY",
     "PLAN_CHECK_TIMEOUT", "PLAN_CHECK_MAX_ATTEMPTS", "PLAN_CHECK_RETRY_DELAY",
     "PLAN_CHECK_REGISTRATION_RECHECK_DELAY", "PLAN_CHECK_WORKERS", "PLAN_CHECK_QUEUE_LIMIT",
     "PLAN_CHECK_MIN_INTERVAL", "PLAN_CHECK_JITTER", "pick_proxy", "PROXY",
+    "build_rotating_proxy", "has_rotating_proxy", "generate_proxy_session_id",
     # register
     "REGISTER_EMAIL", "REGISTER_PASSWORD", "REGISTER_NAME",
     # email
@@ -258,4 +296,10 @@ __all__ = [
     "CLOUDMAIL_AUTO_ADD_USER", "CLOUDMAIL_RANDOM_LOCAL_LENGTH",
     # twofa
     "ENABLE_2FA",
+    # chrome
+    "CHROME_HEADLESS", "CHROME_USE_PROXY", "CHROME_SELENIUM_TIMEOUT",
+    "CHROME_VIEWPORT_WIDTH", "CHROME_VIEWPORT_HEIGHT",
+    "CHROME_LOCALE", "CHROME_TIMEZONE", "CHROME_GEOIP",
+    "CHROME_EXTRA_ARGS", "CHROME_USER_DATA_DIR",
+    "CHROME_KEEP_BROWSER_OPEN", "CHROME_EXECUTABLE_PATH", "CHROME_PASSWORD_SETUP", "CHROME_CF_CHALLENGE_WAIT",
 ]

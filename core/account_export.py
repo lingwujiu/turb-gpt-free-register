@@ -404,6 +404,20 @@ def save_account_data(
     if codex_status == "failed":
         codex_error = codex.get("message")
 
+    # 2FA 降级必须显式告警：这类账号照样会被当成「注册成功」入库，一旦静默，就只能
+    # 事后靠人肉比对账本才能发现（见 2026-10-06 Job 165/166/167/168/172 —— 5 个账号
+    # 既无密码也无 2FA，账本里却全是 success）。这里在唯一的落库入口统一拦截。
+    try:
+        from config import twofa as _twofa_cfg
+
+        if getattr(_twofa_cfg, "ENABLE_2FA", False) and not totp_secret:
+            logger.error(
+                "[Save] 2FA 未取得 secret，账号降级入库（无法完成 2FA 登录校验）: %s", email
+            )
+            extra["mfa_missing"] = True
+    except Exception as exc:
+        logger.debug("[Save] 2FA 降级判定失败（不影响入库）：%s: %s", type(exc).__name__, exc)
+
     row_id = insert_account(
         email=email,
         access_token=access_token,

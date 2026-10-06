@@ -73,6 +73,13 @@ QQ_EMAIL = ""
 # 注意：这是 16 位授权码，不是 QQ 密码
 QQ_IMAP_PASSWORD = env_str("QQ_IMAP_PASSWORD", "")
 
+# 取信时扫描的 IMAP 文件夹（英文逗号分隔多个，按顺序全部扫描后合并结果）
+# 默认只读 INBOX。**请以 QQ 邮箱实际存在的文件夹名为准**，写错的名字不会报错，
+# 只会被静默跳过（表现为"邮件明明到了却读不到"）。
+# QQ 邮箱 IMAP 实际文件夹：INBOX / Junk / &UXZO1mWZHTvZZOQ-（其他文件夹）/ Sent Messages / Drafts / Deleted Messages
+# 实测 Junk 里会出现被误判为垃圾的 OpenAI 邮件，故默认同时扫描 INBOX 与 Junk。
+QQ_IMAP_FOLDER = env_str("QQ_IMAP_FOLDER", "INBOX,Junk")
+
 
 # ============================================================
 # GPTMail 临时邮箱 API（固定地址：https://mail.chatgpt.org.uk）

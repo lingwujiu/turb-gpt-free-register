@@ -1002,10 +1002,40 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
     return "email_page" if _is_email_login_page_still_present(driver) else "unknown"
 
 
+def _is_chrome_error_page(driver) -> bool:
+    """当前是否停在 Chrome 自身的内置错误页（断网/超时后的中间态）。
+
+    这类页面 DOM 为空、URL 形如 `chrome-error://chromewebdata/`，任何基于选择器的
+    状态判定都会失败；必须先重载回真实 URL 才能继续。
+    """
+    try:
+        url = str(driver.current_url or "")
+    except Exception:
+        return False
+    return url.startswith("chrome-error://") or url.startswith("edge-error://")
+
+
 def _submit_email_and_wait_next(driver, email: str, attempts: int = 3) -> str:
     """填写并提交邮箱，必须确认进入 password/otp/logged_in 才返回。"""
     last_state = None
     for attempt in range(1, attempts + 1):
+        # 重试前先重新判定页面真实状态。上一轮可能因瞬时错误页（chrome-error://chromewebdata/）
+        # 或 SPA 跳转抖动而误判为「仍停在邮箱页」，但页面其实已经进入 OTP/密码页；
+        # 此时若继续走「重填邮箱」，会因找不到邮箱输入框直接抛错，把本可成功的任务判死。
+        if attempt > 1:
+            if _is_chrome_error_page(driver):
+                logger.info("%s 检测到 Chrome 内置错误页，重载后重新判定状态", _log_prefix(driver))
+                try:
+                    driver.refresh()
+                except Exception:
+                    pass
+                time.sleep(1.5)
+            probe = _wait_email_submit_next_state(driver, email, timeout=6)
+            if probe == "login_password":
+                raise RuntimeError(f"邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用: url={getattr(driver, 'current_url', '') or 'https://auth.openai.com/log-in/password'}")
+            if probe in ("password", "otp", "logged_in"):
+                logger.info("%s 重试前重新判定，页面实际已进入下一步：%s", _log_prefix(driver), probe)
+                return probe
         _type_email_address(driver, email, timeout=20)
         state = _email_input_value_state(driver)
         last_state = state
@@ -1156,11 +1186,17 @@ def _click_resend_email_otp(driver, timeout: int = 20) -> dict:
 
 
 def _wait_after_email_otp_submit(driver, timeout: int = 30) -> str:
-    """提交 OTP 后等待页面离开验证码页。
+    """提交 OTP 后等待页面离开验证码页。返回三种状态：
 
-    只有页面明确出现验证码错误（aria-invalid / 错误文案）才判定为无效；
-    网络慢时页面跳转可能超过 10s，超时后只要没有错误标记就按 accepted 处理，
-    避免把已提交成功的验证码误判为失败后误点“重新发送”把流程搞乱。
+        'accepted' — 页面已离开验证码页，提交**确实生效**；
+        'invalid'  — 页面明确报错（aria-invalid / 错误文案），验证码无效；
+        'stuck'    — 超时仍停在验证码页且无任何错误标记：**提交动作很可能没生效**
+                     （Continue 点击丢失 / SPA 未响应），不能认定成功。
+
+    为什么必须区分 'stuck' 与 'accepted'：早先版本把「超时未前进、无报错」也当成
+    accepted，上层据此认为「这个码已经提交过了」，于是下一轮读到同一个码时就误判为
+    「码已失效」并触发重发。而 OpenAI 重发有数分钟节流，等待窗往往在邮件到达前就超时，
+    最终账号既没密码也没 2FA（job 172 即为此类）。'stuck' 让上层可以改为「重新提交」。
     """
     end = time.time() + timeout
     last = {}
@@ -1173,19 +1209,66 @@ def _wait_after_email_otp_submit(driver, timeout: int = 30) -> str:
         if invalid or (last.get('errors') or []):
             return 'invalid'
     if _is_email_verification_page(driver):
-        # 超时仍停留：若无明确错误标记，判定为提交成功、跳转缓慢，按 accepted 放行。
+        # 超时仍停留：分两种情况，必须区分开，否则会误导上层。
         has_error_mark = bool(last.get('errors')) or any(
             str(i.get('ariaInvalid') or '').lower() == 'true' for i in (last.get('inputs') or [])
         )
         if has_error_mark:
             logger.warning("%s[OTP] 提交后仍停留验证码页且存在错误标记，按验证码无效处理 snapshot=%s", _log_prefix(driver), last)
             return 'invalid'
+        # 无错误标记但页面也没前进 —— **不能**当作提交成功。更常见的原因是提交动作
+        # 根本没生效（Continue 点击丢失 / SPA 未响应）。谎报 accepted 会让上层误以为
+        # 「已提交」，下一轮把同一个码判成「已失效」并触发重发（job 172 因此丢了密码 + 2FA）。
         logger.warning(
-            "%s[OTP] 提交后 %ss 仍在验证码页但无错误标记，按跳转缓慢处理（accepted） snapshot=%s",
+            "%s[OTP] 提交后 %ss 仍在验证码页且无错误标记，判定提交动作未生效（stuck） snapshot=%s",
             _log_prefix(driver), timeout, last
         )
-        return 'accepted'
+        return 'stuck'
     return 'accepted'
+
+
+def _submit_email_otp_and_settle(
+    driver, code: str, attempts: int = 3, wait_timeout: int = 12
+) -> str:
+    """填入邮箱验证码并提交，自动处理 stuck（页面未前进且无报错）。
+
+    stuck 的最常见原因是**提交动作没生效**（Continue 点击丢失 / SPA 未响应），
+    而不是验证码本身失效。因此策略是「重载页面 → 重提同一个码」，而不是急着换码；
+    重载还有额外好处：若服务端其实已通过，重载会促使 SPA 重新拉取状态并直接跳到下一步。
+
+    返回最后一次 ``_wait_after_email_otp_submit`` 的结果：
+        'accepted' 页面已前进；'invalid' 页面明确报错；'stuck' 用尽 attempts 仍停留。
+    """
+    outcome = 'stuck'
+    for i in range(max(1, attempts)):
+        if i > 0:
+            try:
+                driver.refresh()
+            except Exception:
+                pass
+            time.sleep(3)
+            # 重载后先看页面是否已经前进（服务端其实已通过的情况）
+            if not _is_email_verification_page(driver):
+                return 'accepted'
+            try:
+                _clear_otp_inputs(driver)
+            except Exception:
+                pass
+        try:
+            _type_otp(driver, code)
+            time.sleep(1.5)
+            _click_continue(driver)
+        except Exception:
+            pass
+        outcome = _wait_after_email_otp_submit(driver, timeout=wait_timeout)
+        if outcome != 'stuck':
+            logger.info("%s[OTP] 验证码提交结果：%s（第 %s/%s 次尝试）", _log_prefix(driver), outcome, i + 1, attempts)
+            return outcome
+        logger.warning(
+            "%s[OTP] 第 %s/%s 次提交后页面未前进且无报错，判定提交动作未生效，重载页面后重提同一个码",
+            _log_prefix(driver), i + 1, attempts,
+        )
+    return outcome
 
 
 def _click_continue(driver) -> None:
@@ -2057,23 +2140,17 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                     current_otp = None
                     continue
             logger.info("[Roxy注册][OTP] 收到验证码：%s", current_otp)
-            _clear_otp_inputs(driver)
-            _type_otp(driver, current_otp)
-            logger.info("[Roxy注册][OTP] 已填写邮箱验证码")
             _check_manual_stop()
-            human_delay("otp_input")
-            try:
-                _click_continue(driver)
-                logger.info("[Roxy注册][OTP] 已提交邮箱验证码，等待资料页或登录态")
-            except Exception as exc:
-                logger.info("[Roxy注册][OTP] 未找到显式提交按钮，继续等待页面状态：%s", str(exc)[:120])
-
-            outcome = _wait_after_email_otp_submit(driver, timeout=30)
+            # 提交验证码并自动处理 stuck：页面未前进且无报错时，**重载页面后重提同一个码**，
+            # 避免把「提交动作没生效」误判成「码已失效」而白白换码（job 172/175 的教训）。
+            outcome = _submit_email_otp_and_settle(driver, current_otp, attempts=3, wait_timeout=30)
             if outcome == 'accepted':
                 break
+            # invalid（页面明确报错）或 stuck（多次重提仍不前进）→ 换新码再来一轮
             if otp_attempt >= max_otp_attempts:
                 raise RuntimeError("邮箱验证码连续错误/过期，已达到最大重试次数")
-            logger.warning("[Roxy注册][OTP] 验证码错误/过期，准备重新发送并重新获取验证码（%s/%s）", otp_attempt + 1, max_otp_attempts)
+            logger.warning("[Roxy注册][OTP] 验证码未被接受（%s），准备重新发送并重新获取验证码（%s/%s）",
+                           outcome, otp_attempt + 1, max_otp_attempts)
             otp_after_ts = time.time()
             _click_resend_email_otp(driver, timeout=25)
             human_delay("api")
@@ -2095,9 +2172,23 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
         logger.info("[Roxy注册] 已拿到 accessToken：%s", email)
         _check_manual_stop()
 
-        if _twofa_cfg.ENABLE_2FA:
-            logger.warning("[Roxy注册] 当前 Roxy 自动化路径暂不执行 2FA 设置，已跳过")
         totp_secret = None
+        if _twofa_cfg.ENABLE_2FA:
+            # 浏览器内 UI 流开启 TOTP（复用当前已登录会话，无需重认证）。
+            try:
+                from core.browser_2fa import setup_2fa_via_browser
+
+                totp_secret = setup_2fa_via_browser(
+                    driver,
+                    email,
+                    password=openai_password,
+                    prefix="[Roxy注册][2FA]",
+                )
+                if not totp_secret:
+                    logger.warning("[Roxy注册][2FA] 未能取得 TOTP secret，本次账号不含 2FA")
+            except Exception as exc:
+                logger.error("[Roxy注册][2FA] 设置失败：%s: %s", type(exc).__name__, exc)
+                logger.debug("[Roxy注册][2FA] 失败详情", exc_info=True)
 
         codex_result = {
             "status": "skipped",

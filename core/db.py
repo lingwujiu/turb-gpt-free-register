@@ -51,19 +51,65 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+_STORAGE_READY = False
+
+
 def _ensure_storage() -> None:
+    """确保数据/日志目录存在（记忆化：目录只需建一次）。
+
+    此前每次读写 JSON 都会调用 mkdir；任务列表接口会对每条任务查询
+    一次账号，任务量大时累积成数百次系统调用。在受限宿主环境下
+    mkdir 需走宿主 IPC（单次约 13ms），足以把列表接口拖到超时。
+    """
+    global _STORAGE_READY
+    if _STORAGE_READY:
+        return
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _STORAGE_READY = True
+
+
+# 文件内容缓存：{路径: (mtime_ns, size, 原始文本)}
+# 任务列表接口会对每条任务反复读取同一批 JSON（任务表 + 账号表），
+# 磁盘读取 300KB 级文件约 140ms，而 json.loads 仅 1~3ms，
+# 故缓存"文本"、每次重新解析：提速数十倍，且返回的永远是全新对象，
+# 不存在调用方修改后污染缓存的隐患。
+# 文件被改写（mtime_ns/size 变化）时自动失效，跨进程写入同样能感知。
+_READ_CACHE: dict[str, tuple[int, int, str]] = {}
+_READ_CACHE_LOCK = threading.Lock()
+_READ_CACHE_MAX = 64
 
 
 def _read_json(path: Path, default: Any) -> Any:
     _ensure_storage()
-    if not path.exists():
-        return default
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        st = path.stat()
+    except OSError:
+        return default
+    key = str(path)
+    sig = (st.st_mtime_ns, st.st_size)
+    try:
+        with _READ_CACHE_LOCK:
+            cached = _READ_CACHE.get(key)
+        if cached is not None and cached[0] == sig[0] and cached[1] == sig[1]:
+            text = cached[2]
+        else:
+            text = path.read_text(encoding="utf-8")
+            with _READ_CACHE_LOCK:
+                if len(_READ_CACHE) >= _READ_CACHE_MAX and key not in _READ_CACHE:
+                    _READ_CACHE.clear()
+                _READ_CACHE[key] = (sig[0], sig[1], text)
     except Exception:
         return default
+    try:
+        return json.loads(text)
+    except Exception:
+        return default
+
+
+def _invalidate_read_cache(path: Path) -> None:
+    with _READ_CACHE_LOCK:
+        _READ_CACHE.pop(str(path), None)
 
 
 def _write_json(path: Path, data: Any) -> None:
@@ -73,7 +119,18 @@ def _write_json(path: Path, data: Any) -> None:
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    tmp.replace(path)
+    try:
+        tmp.replace(path)
+    except PermissionError:
+        # 某些宿主环境（沙箱 broker）会拦截 rename 覆盖已有文件；
+        # 回退为直接写目标文件（内容相同，仅失去原子性）。
+        path.write_text(tmp.read_text(encoding="utf-8"), encoding="utf-8")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    # 写入后立即失效缓存，避免依赖时间戳精度。
+    _invalidate_read_cache(path)
 
 
 def _next_id(items: list[dict]) -> int:
@@ -534,6 +591,20 @@ def _decorate_account(row: dict) -> dict:
             out["plan_check_error"] = "上次套餐查询状态异常，可重新查询"
             out["plan_check_stale"] = True
     out["copy_line"] = _account_line(out)
+    # 完整性标记：开启 2FA 却拿不到 secret、或压根没设密码的账号无法再次登录，
+    # 但历史上它们照样被当成「注册成功」混进统计（2026-10-06 Job 165/166/167/168/172）。
+    # 在展示层统一派生，历史账号与新增账号一视同仁，且不污染落库数据。
+    extra = out.get("extra_json")
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except Exception:
+            extra = {}
+    if not isinstance(extra, dict):
+        extra = {}
+    out["mfa_missing"] = not bool(out.get("totp_secret"))
+    out["password_missing"] = not bool(extra.get("registration_password"))
+    out["incomplete"] = bool(out["mfa_missing"] and out["password_missing"])
     return out
 
 
@@ -2092,6 +2163,29 @@ def _new_job_row(
         "account_id": account_id,
         "created_at": _now(),
     }
+
+
+def recover_interrupted_jobs() -> int:
+    """服务启动时把上次进程异常退出遗留的注册任务标记为失败，避免 running 僵尸长期卡在列表里。
+
+    仅在 WebUI 启动阶段调用：此时新进程的线程池还没拉起任何任务，
+    账本里残留的 running/stopping 必然是上次进程退出时没来得及收尾的僵尸记录。
+    只处理 running/stopping；pending 保持原样（它代表排队待跑，用户可自行启动或取消）。
+    """
+    with _LOCK:
+        rows = _load_jobs()
+        recovered = 0
+        now = _now()
+        for row in rows:
+            if row.get("status") not in ("running", "stopping"):
+                continue
+            row["status"] = "failed"
+            row["error_message"] = "WebUI 重启或进程异常退出，任务未完成"
+            row["completed_at"] = now
+            recovered += 1
+        if recovered:
+            _save_jobs(rows)
+        return recovered
 
 
 def create_job(email_source: str) -> dict:

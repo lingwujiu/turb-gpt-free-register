@@ -315,25 +315,54 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
             continue
         used_codes.add(str(code))
         logger.info("[Codex][Browser] 邮箱 OTP 收到：%s", code)
-        _wait_for_otp_input(driver, timeout=30)
-        _clear_otp_inputs(driver)
-        _type_otp(driver, code)
-        logger.info("[Codex][Browser] 已填写邮箱 OTP")
-        human_delay("otp_input")
-        _install_email_otp_validate_hook(driver)
-        clicked = _click_if_present(driver, [
-            "button[type='submit']",
-            "//button[contains(., 'Continue')]",
-            "//button[contains(., '继续')]",
-            "//button[contains(., 'Verify')]",
-            "//button[contains(., '验证')]",
-        ], timeout=8)
-        if clicked:
-            logger.info("[Codex][Browser] 已提交邮箱 OTP，等待后续授权/手机号页面")
-        else:
-            logger.info("[Codex][Browser] 未找到显式提交按钮，继续等待页面状态")
 
-        outcome = _wait_after_email_otp_submit(driver, timeout=45)
+        def _fill_and_submit(current_code: str) -> str:
+            """填码 → 提交 → 等待页面前进，返回页面状态判定。"""
+            _wait_for_otp_input(driver, timeout=30)
+            _clear_otp_inputs(driver)
+            _type_otp(driver, current_code)
+            logger.info("[Codex][Browser] 已填写邮箱 OTP：%s", current_code)
+            human_delay("otp_input")
+            _install_email_otp_validate_hook(driver)
+            clicked = _click_if_present(driver, [
+                "button[type='submit']",
+                "//button[contains(., 'Continue')]",
+                "//button[contains(., '继续')]",
+                "//button[contains(., 'Verify')]",
+                "//button[contains(., '验证')]",
+            ], timeout=8)
+            if clicked:
+                logger.info("[Codex][Browser] 已提交邮箱 OTP，等待后续授权/手机号页面")
+            else:
+                logger.info("[Codex][Browser] 未找到显式提交按钮，继续等待页面状态")
+            return _wait_after_email_otp_submit(driver, timeout=45)
+
+        outcome = _fill_and_submit(code)
+
+        # stuck = 页面既没前进也没报错，最常见原因是**提交动作没生效**，而不是码失效。
+        # 先「重载 + 重提同一个码」；重发换码有数分钟节流，急着换会把等待窗耗尽
+        # （2026-10-06 job 172 就是这样丢掉了密码 + 2FA）。仅当同码连续多轮 stuck 才升级。
+        same_code_round = 0
+        while outcome == "stuck" and same_code_round < _STUCK_SAME_CODE_ROUNDS:
+            same_code_round += 1
+            logger.warning(
+                "[Codex][Browser] 第 %s/%s 轮提交后页面未前进且无报错，判定提交动作未生效，"
+                "重载页面后重提同一个码：%s",
+                same_code_round, _STUCK_SAME_CODE_ROUNDS, code,
+            )
+            try:
+                driver.refresh()
+            except Exception:
+                pass
+            human_delay("navigate")
+            # 重载后服务端可能其实已通过：直接检查是否已跳走，避免多余提交
+            current = str(getattr(driver, "current_url", "") or "")
+            if (_is_callback_url(current) or _has_strict_add_phone_form(driver)
+                    or _is_phone_code_page(driver) or "email-verification" not in current.lower()):
+                logger.info("[Codex][Browser] 重载后发现页面已前进，按提交成功处理")
+                return
+            outcome = _fill_and_submit(code)
+
         logger.info("[Codex][Browser] 邮箱 OTP 提交后状态：%s", outcome)
         if outcome == "accepted":
             return
@@ -471,7 +500,15 @@ def _wait_after_email_otp_submit(driver, timeout: int = 45) -> str:
 
     返回：
       - accepted：已离开邮箱验证码页 / 进入手机号页 / 进入 callback；
-      - invalid：页面明确报错、输入框标红，或长时间停留验证码页。
+      - invalid：页面明确报错、输入框标红；
+      - stuck：超时仍停在验证码页且没有任何错误标记 —— 提交动作很可能没生效
+        （Continue 点击丢失 / SPA 未响应），**不能**当成验证码错误。
+      - deactivated:<code>：服务端已判定账号废弃。
+
+    为什么必须把 stuck 从 invalid 里拆出来：早先超时一律返回 invalid，上层据此认定
+    「码错了」→ 重发换码。而 OpenAI 重发有数分钟节流，等待窗往往在邮件到达前就耗尽，
+    最终会把本来能成的账号做废（2026-10-06 job 172 即为此类）。stuck 让上层可以改为
+    「重载页面 + 重提同一个码」。
     """
     end = time.time() + timeout
     last_url = ""
@@ -516,8 +553,15 @@ def _wait_after_email_otp_submit(driver, timeout: int = 45) -> str:
         except Exception:
             pass
         time.sleep(0.5)
-    logger.warning("[Codex][Browser] 邮箱 OTP 后等待跳转超时，当前 url=%s，按验证码无效/过期处理", getattr(driver, "current_url", ""))
-    return "invalid"
+    logger.warning(
+        "[Codex][Browser] 邮箱 OTP 后等待跳转超时且无任何错误标记，判定提交动作未生效（stuck），当前 url=%s",
+        getattr(driver, "current_url", ""),
+    )
+    return "stuck"
+
+
+# stuck 时最多「重载 + 重提同一个码」几轮，之后才升级为重新发信换码。
+_STUCK_SAME_CODE_ROUNDS = 2
 
 
 def _phone_page_state(driver) -> dict:

@@ -1851,9 +1851,23 @@ def run_browser_use_registration(
             create_acknowledged = True
             logger.info("[BrowserUse] 已拿到 accessToken：%s", email)
 
-            if _twofa_cfg.ENABLE_2FA:
-                logger.warning("[BrowserUse] 当前路径暂不自动设置 2FA，已跳过")
             totp_secret = None
+            if _twofa_cfg.ENABLE_2FA:
+                # 本路径直接持有原生 Playwright Page，先适配成 driver 门面再跑 UI 流。
+                try:
+                    from core.browser_2fa import adapt_playwright_page, setup_2fa_via_browser
+
+                    totp_secret = setup_2fa_via_browser(
+                        adapt_playwright_page(page),
+                        email,
+                        password=openai_password,
+                        prefix="[BrowserUse][2FA]",
+                    )
+                    if not totp_secret:
+                        logger.warning("[BrowserUse][2FA] 未能取得 TOTP secret，本次账号不含 2FA")
+                except Exception as exc:
+                    logger.error("[BrowserUse][2FA] 设置失败：%s: %s", type(exc).__name__, exc)
+                    logger.debug("[BrowserUse][2FA] 失败详情", exc_info=True)
 
             codex_result = {
                 "status": "skipped",

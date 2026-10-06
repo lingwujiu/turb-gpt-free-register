@@ -184,6 +184,26 @@ def _disable_job_email(email: str | None, reason: str) -> bool:
         return False
 
 
+def _mark_domain_email_used(email: str | None) -> None:
+    """注册成功后把域名邮箱标记为已用，避免池子里堆积「假可用」条目。
+
+    只处理 cloudflare_domain：该来源的邮箱是 catch-all 域名按需随机生成的，
+    注册完成后不会被再次领取，池子纯台账，标记 used 只是让状态与真实结果一致。
+    outlook / API 等可复用邮箱池不在此处改动，避免影响既有产能策略。
+    """
+    if not email:
+        return
+    try:
+        from core.email_provider import release_email, resolve_email_source
+
+        if resolve_email_source(email) != "cloudflare_domain":
+            return
+        release_email(email, status="used", note="注册成功")
+        logger.info("[Service] 域名邮箱已标记为已用: %s", email)
+    except Exception:
+        logger.debug("[Service] 标记域名邮箱已用失败: %s", email, exc_info=True)
+
+
 def _normalize_workers(max_workers: int | None) -> int:
     if max_workers is None:
         return _DEFAULT_MAX_WORKERS
@@ -313,6 +333,7 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                 log_logger.warning(f"[Job {job_id}] 已按用户请求停止")
                 return
             if isinstance(result, dict) and result.get("success"):
+                _mark_domain_email_used(result.get("email") or email)
                 db.update_job(
                     job_id,
                     status="success",

@@ -47,7 +47,39 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "REGISTRATION_DRIVER", "file": "roxybrowser.py", "type": "str", "group": "注册方式",
-        "label": "注册驱动", "help": "默认推荐 roxy；protocol=纯协议，容易封号不建议；roxy=RoxyBrowser；cloak=CloakBrowser；browser_use=Browser Use Cloud+Playwright；skyvern=Skyvern Browser Sessions+Playwright",
+        "label": "注册驱动", "help": "chrome=本机 Google Chrome（零凭证、推荐，可配「无窗口运行」后台静默跑）；protocol=纯协议，会被 OpenAI 静默拦信不建议；roxy=RoxyBrowser；cloak=CloakBrowser；browser_use=Browser Use Cloud+Playwright；skyvern=Skyvern Browser Sessions+Playwright",
+    },
+
+    # ---- 本机 Chrome（chrome 驱动）----
+    {
+        "key": "CHROME_HEADLESS", "file": "chrome.py", "type": "bool", "group": "本机 Chrome",
+        "label": "无窗口运行", "help": "True=后台静默运行，不弹出任何浏览器窗口，可无人值守批量；False=显示 Chrome 窗口。必须同时保持「无头UA伪装」开启，否则会被 Cloudflare 403",
+        "storage": "env",
+    },
+    {
+        "key": "CHROME_HEADLESS_UA_MASK", "file": "chrome.py", "type": "bool", "group": "本机 Chrome",
+        "label": "无头UA伪装", "help": "无窗口运行时把 UA 里的 HeadlessChrome 标记还原成常规 Chrome。实测关闭后 chatgpt.com 直接返回 403，除非有特殊理由不要关",
+        "storage": "env",
+    },
+    {
+        "key": "CHROME_USE_PROXY", "file": "chrome.py", "type": "bool", "group": "本机 Chrome",
+        "label": "Chrome 使用代理", "help": "把代理池/轮换模板生成的代理传给本机 Chrome；关闭则直连出口",
+        "storage": "env",
+    },
+    {
+        "key": "CHROME_PASSWORD_SETUP", "file": "chrome.py", "type": "bool", "group": "本机 Chrome",
+        "label": "注册后补设密码", "help": "新版 OpenAI 注册流默认无密码，开启后到「设置→安全」补设真实密码，使导出账号带密码",
+        "storage": "env",
+    },
+    {
+        "key": "CHROME_CF_CHALLENGE_WAIT", "file": "chrome.py", "type": "int", "group": "本机 Chrome",
+        "label": "CF 挑战等待秒数", "help": "命中 Cloudflare「Just a moment」挑战页时最多等待多少秒自动放行，默认 90",
+        "storage": "env",
+    },
+    {
+        "key": "CHROME_KEEP_BROWSER_OPEN", "file": "chrome.py", "type": "bool", "group": "本机 Chrome",
+        "label": "注册后保留浏览器", "help": "调试用：注册完成后不关闭浏览器，方便人工查看结果；无窗口模式下无实际意义",
+        "storage": "env",
     },
 
     # ---- CloakBrowser ----
@@ -447,6 +479,42 @@ EDITABLE_FIELDS = [
     {
         "key": "PROXY_POOL", "file": "proxy.py", "type": "list_str_multiline", "group": "代理池",
         "label": "代理池(每行一个)", "help": "每行一个代理 URL，留空行会被忽略；为空则不使用代理",
+    },
+    {
+        "key": "ROTATING_PROXY_TEMPLATE", "file": "proxy.py", "type": "str", "group": "代理池",
+        "label": "商业轮换代理模板",
+        "help": "填了它就跑「自动代理」：每次注册现场生成一个粘性会话，导出 IP 自动轮换。"
+                "占位符 {session}=随机会话ID、{country}=国家代码、{city}=城市。"
+                "例：http://user-xxx-country-{country}-session-{session}:密码@gate.xxx.com:8000"
+                "（不支持 SOCKS 带认证；Chromium 不支持 SOCKS5 账密）。"
+                "⚠️ 大陆网络下建议用 https:// 开头：http:// 代理发给网关的 CONNECT 是明文，"
+                "目标域名会被中间网络识别并重置（chatgpt.com / google.com 必挂）；https:// 会加密，可绕开。"
+                "网关不支持 TLS 时才退回 http://。留空则用上面的代理池",
+        "storage": "env", "secret": True,
+    },
+    {
+        "key": "ROTATING_PROXY_COUNTRY", "file": "proxy.py", "type": "str", "group": "代理池",
+        "label": "轮换代理国家", "help": "模板里 {country} 的取值，小写两位国家码（us/jp/de…）；留空则用厂商默认地区",
+    },
+    {
+        "key": "ROTATING_PROXY_CITY", "file": "proxy.py", "type": "str", "group": "代理池",
+        "label": "轮换代理城市", "help": "模板里 {city} 的取值；留空则不注入，多数厂商不需要填",
+    },
+    {
+        "key": "ROTATING_PROXY_SESSION_LEN", "file": "proxy.py", "type": "int", "group": "代理池",
+        "label": "会话ID长度", "help": "每个账号生成的粘性会话 ID 长度，建议 8-16；太短可能与其他会话撞车",
+    },
+    {
+        "key": "ROTATING_PROXY_SESSION_TTL", "file": "proxy.py", "type": "int", "group": "代理池",
+        "label": "会话粘性(分钟)", "help": "仅作留档与体检提示：粘性会话需覆盖单账号注册耗时（2-5 分钟），建议 ≥10；实际 TTL 以厂商侧配置为准",
+    },
+    {
+        "key": "ROTATING_PROXY_VERIFY_COUNTRY", "file": "proxy.py", "type": "bool", "group": "代理池",
+        "label": "校验出口国家", "help": "开启后每次生成会话都会探测出口国家，与「轮换代理国家」不符则换新会话重试；部分厂商国家定向不是 100% 生效（实测偶发 us 落到葡萄牙），建议保持开启",
+    },
+    {
+        "key": "ROTATING_PROXY_VERIFY_ATTEMPTS", "file": "proxy.py", "type": "int", "group": "代理池",
+        "label": "出口校验次数", "help": "出口国家不符时最多尝试生成几个会话（含首次），默认 3；探测本身失败不会重试",
     },
     {
         "key": "PLAN_CHECK_PROXY_MODE", "file": "proxy.py", "type": "str", "group": "代理池",

@@ -149,6 +149,21 @@ def _msg_to_dict(msg) -> dict:
 # IMAP 连接与搜索
 # ============================================================
 
+def _to_imap_utf7(name: str) -> str:
+    """把中文等非 ASCII 文件夹名转成 RFC 3501 modified UTF-7（QQ 邮箱 IMAP 要求）。"""
+    if name.isascii():
+        return name
+    try:
+        import base64 as _b64
+
+        utf16 = name.encode("utf-16-be")
+        encoded = _b64.b64encode(utf16).decode("ascii").rstrip("=")
+        encoded = encoded.replace("/", ",")
+        return f"&{encoded}-"
+    except Exception:
+        return name
+
+
 def _connect_imap() -> imaplib.IMAP4_SSL:
     """连接 QQ 邮箱 IMAP 服务器并返回连接对象。"""
     server = _email_cfg.QQ_IMAP_SERVER
@@ -172,38 +187,54 @@ def _connect_imap() -> imaplib.IMAP4_SSL:
         raise QQMailClientError(f"QQ 邮箱 IMAP 连接失败: {exc}")
 
 
+def _configured_folders() -> list[str]:
+    """解析 QQ_IMAP_FOLDER（逗号分隔），返回要去扫描的文件夹列表。"""
+    raw = getattr(_email_cfg, "QQ_IMAP_FOLDER", "INBOX") or "INBOX"
+    folders = [f.strip() for f in str(raw).split(",") if f.strip()]
+    return folders or ["INBOX"]
+
+
 def _search_messages(mail: imaplib.IMAP4_SSL, after_dt: datetime | None = None) -> list[dict]:
-    """搜索收件箱中 after_dt 之后的邮件，返回 dict 列表。"""
+    """搜索配置的所有文件夹中 after_dt 之后的邮件，返回 dict 列表（按文件夹顺序合并）。"""
     search_criteria = "ALL"
     if after_dt is not None:
         date_str = after_dt.strftime("%d-%b-%Y")
         search_criteria = f'(SINCE {date_str})'
 
-    status, msg_ids = mail.search(None, search_criteria)
-    if status != "OK":
-        logger.warning(f"[QQMail] IMAP search 失败: {status}")
-        return []
-
-    ids = msg_ids[0].split() if msg_ids[0] else []
-    if not ids:
-        return []
-
-    # 只取最近 15 封（防止 inbox 太大，也够用）
-    recent_ids = ids[-15:]
-
-    messages = []
-    for mid in recent_ids:
-        status, data = mail.fetch(mid, "(RFC822)")
-        if status != "OK":
-            continue
-        raw_email = data[0][1]
+    messages: list[dict] = []
+    for folder in _configured_folders():
         try:
-            msg = email_lib.message_from_bytes(raw_email)
-            item = _msg_to_dict(msg)
-            messages.append(item)
+            status, _ = mail.select(_to_imap_utf7(folder))
+            if status != "OK":
+                logger.debug(f"[QQMail] 文件夹 {folder!r} 不可读，跳过")
+                continue
         except Exception as exc:
-            logger.debug(f"[QQMail] 解析邮件 {mid} 失败: {exc}")
+            logger.debug(f"[QQMail] 选择文件夹 {folder!r} 失败，跳过: {exc}")
             continue
+
+        status, msg_ids = mail.search(None, search_criteria)
+        if status != "OK":
+            logger.warning(f"[QQMail] IMAP search 失败 ({folder}): {status}")
+            continue
+
+        ids = msg_ids[0].split() if msg_ids[0] else []
+        if not ids:
+            continue
+
+        # 只取最近 15 封（防止文件夹太大，也够用）
+        recent_ids = ids[-15:]
+        for mid in recent_ids:
+            status, data = mail.fetch(mid, "(RFC822)")
+            if status != "OK":
+                continue
+            raw_email = data[0][1]
+            try:
+                msg = email_lib.message_from_bytes(raw_email)
+                item = _msg_to_dict(msg)
+                messages.append(item)
+            except Exception as exc:
+                logger.debug(f"[QQMail] 解析邮件 {mid} 失败: {exc}")
+                continue
 
     return messages
 
@@ -263,9 +294,13 @@ def fetch_latest_otp(
     """
     if not after_ts:
         after_ts = time.time()
-    deadline = time.time() + (max_wait or _email_cfg.OTP_MAX_WAIT)
+    started_at = time.time()
+    deadline = started_at + (max_wait or _email_cfg.OTP_MAX_WAIT)
     interval = poll_interval or _email_cfg.OTP_POLL_INTERVAL
     settle = settle_seconds if settle_seconds is not None else _email_cfg.OTP_SETTLE_SECONDS
+    # 「暂未收到」的空转提示做节流：poll_interval 默认 3s，逐轮打印会刷屏且看着像卡死。
+    last_idle_log_at = 0.0
+    idle_log_every = 15.0
     # 30s 时钟偏差容忍
     after_dt = datetime.fromtimestamp(after_ts - 30, tz=timezone.utc)
 
@@ -360,9 +395,13 @@ def fetch_latest_otp(
                 f"[QQMail] 已锁定候选 OTP={best_otp}，等 settle 中"
                 f"（剩余 settle ~{int(settle_until - now)}s, 总剩余 {remaining}s）..."
             )
-        else:
+        elif now - last_idle_log_at >= idle_log_every:
+            last_idle_log_at = now
+            waited = int(now - started_at)
             logger.info(
-                f"[QQMail] 暂未收到 OpenAI 邮件，{interval}s 后重试（剩余 {remaining}s）..."
+                f"[QQMail] 等待验证码中…已等待 {waited}s（剩余 {remaining}s）。"
+                f"注：邮件投递到 QQ 是即时的（已与 INTERNALDATE 核对），但 QQ IMAP 的 "
+                f"SEARCH 对新邮件存在 1~2 分钟可见性滞后，期间查不到属正常现象。"
             )
         time.sleep(interval)
 

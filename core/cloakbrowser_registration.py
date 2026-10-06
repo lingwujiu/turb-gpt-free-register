@@ -17,6 +17,7 @@ from core.humanize import delay as human_delay
 from core.roxy_registration import (  # noqa: F401
     _maybe_accept, _submit_email_and_wait_next, _fill_password_page_if_present,
     _clear_otp_inputs, _type_otp, _click_continue, _wait_after_email_otp_submit,
+    _submit_email_otp_and_settle,
     _click_resend_email_otp, _complete_profile_page, _fetch_chatgpt_session, _check_manual_stop,
 )
 
@@ -69,19 +70,18 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
                     current_otp = None
                     continue
             logger.info("[Cloak注册][OTP] 收到验证码：%s", current_otp)
-            _clear_otp_inputs(driver)
-            _type_otp(driver, current_otp)
-            human_delay("otp_input")
-            try:
-                _click_continue(driver)
-            except Exception as exc:
-                logger.info("[Cloak注册][OTP] 未找到显式提交按钮，继续等待页面状态：%s", str(exc)[:120])
-
-            outcome = _wait_after_email_otp_submit(driver, timeout=10)
+            # 提交验证码并自动处理 stuck：页面未前进且无报错时，**重载页面后重提同一个码**，
+            # 避免把「提交动作没生效」误判成「码已失效」而白白换码（job 172/175 的教训）。
+            outcome = _submit_email_otp_and_settle(driver, current_otp, attempts=3, wait_timeout=10)
             if outcome == "accepted":
                 break
+            # invalid（页面明确报错）或 stuck（多次重提仍不前进）→ 换新码再来一轮
             if otp_attempt >= max_otp_attempts:
                 raise RuntimeError("邮箱验证码连续错误/过期，已达到最大重试次数")
+            logger.warning(
+                "[Cloak注册][OTP] 验证码未被接受（%s），点击“重新发送电子邮件”换新码（下一轮 %s/%s）",
+                outcome, otp_attempt + 1, max_otp_attempts,
+            )
             otp_after_ts = time.time()
             _click_resend_email_otp(driver, timeout=25)
             human_delay("api")
@@ -96,9 +96,23 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
         access_token = session_info["accessToken"]
         logger.info("[Cloak注册] 已拿到 accessToken：%s", email)
 
-        if _twofa_cfg.ENABLE_2FA:
-            logger.warning("[Cloak注册] 当前 CloakBrowser 自动化路径暂不执行 2FA 设置，已跳过")
         totp_secret = None
+        if _twofa_cfg.ENABLE_2FA:
+            # 浏览器内 UI 流开启 TOTP（复用当前已登录会话，无需重认证）。
+            try:
+                from core.browser_2fa import setup_2fa_via_browser
+
+                totp_secret = setup_2fa_via_browser(
+                    driver,
+                    email,
+                    password=openai_password,
+                    prefix="[Cloak注册][2FA]",
+                )
+                if not totp_secret:
+                    logger.warning("[Cloak注册][2FA] 未能取得 TOTP secret，本次账号不含 2FA")
+            except Exception as exc:
+                logger.error("[Cloak注册][2FA] 设置失败：%s: %s", type(exc).__name__, exc)
+                logger.debug("[Cloak注册][2FA] 失败详情", exc_info=True)
 
         codex_result = {
             "status": "skipped",

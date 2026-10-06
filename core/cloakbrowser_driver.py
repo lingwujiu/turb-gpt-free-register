@@ -83,6 +83,25 @@ class CloakElement:
         except Exception:
             return ""
 
+    @property
+    def text(self) -> str:
+        """元素可见文本，对齐 Selenium 的 `WebElement.text`。
+
+        Cloak/Chrome 适配器此前**没有**该属性，导致所有以 `el.text` 做兜底判定的
+        逻辑在本机 Chrome / Cloak 下必然抛 AttributeError——最典型的就是
+        `roxy_registration._click_resend_email_otp` 的多语言按钮文本匹配，
+        表现为「重新发送验证码」永远失败（实测 job 168）。
+        """
+        try:
+            if self.locator is not None:
+                return str(self.locator.inner_text(timeout=2000) or "").strip()
+        except Exception:
+            pass
+        try:
+            return str(self._eval("el => (el.innerText || el.textContent || '').trim()") or "")
+        except Exception:
+            return ""
+
     def send_keys(self, *values: str) -> None:
         # 兼容 Selenium: el.send_keys(Keys.COMMAND, 'a')。
         text = "".join(str(v or "") for v in values)

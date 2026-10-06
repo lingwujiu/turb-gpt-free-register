@@ -223,6 +223,9 @@ def create_app(auth_code: str | None = None) -> Flask:
     recovered_codex_agents = db.recover_interrupted_codex_agents()
     if recovered_codex_agents:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的 Codex Agent Token 状态", recovered_codex_agents)
+    recovered_jobs = db.recover_interrupted_jobs()
+    if recovered_jobs:
+        logger.warning("已恢复 %s 个因 WebUI 重启中断的注册任务（已标记为失败，可重试）", recovered_jobs)
 
     # ----------------------------------------------------------
     # 页面
@@ -2210,10 +2213,9 @@ def create_app(auth_code: str | None = None) -> Flask:
             # 临时邮箱在任务开始时动态生成，不需要本地邮箱池容量提示。
             warning = ""
         elif "cloudflare_domain" in sources:
-            pool = db.domain_email_pool_summary()
+            # 域名邮箱每次注册按需随机生成新地址（catch-all 域名），历史池只作台账，
+            # 不存在"库存不足"，因此不基于 available 数量给出提示，避免误导。
             warning = ""
-            if sources == ["cloudflare_domain"] and pool.get("available", 0) < count:
-                warning = f"域名邮箱池仅 {pool.get('available', 0)} 个可用，少于任务数 {count}，不足的会自动生成"
         elif sources == ["generic_api"]:
             pool = db.generic_api_email_pool_summary()
             warning = ""

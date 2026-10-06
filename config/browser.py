@@ -25,8 +25,8 @@ def _latest_chrome_major(default: str = "149") -> str:
     return default
 
 
-CHROME_MAJOR = "149"
-CHROME_FULL_VERSION = "149.0.0.0"
+CHROME_MAJOR = "124"
+CHROME_FULL_VERSION = "124.0.0.0"
 
 SAFARI_VERSION = ""
 SAFARI_WEBKIT_VERSION = "537.36"
@@ -34,7 +34,7 @@ MAC_OS_UA_VERSION = "10_15_7"
 
 # ---------- curl_cffi 模拟浏览器 ----------
 # curl_cffi 0.15 当前最高内置到 chrome146；HTTP/JS 画像按抓包补齐到 Chrome/149。
-IMPERSONATE = "chrome146"
+IMPERSONATE = "chrome124"
 
 # ---------- 桌面 Chrome 画像 ----------
 BROWSER_FAMILY = "chrome"
@@ -49,8 +49,8 @@ USER_AGENT = (
     f"Chrome/{CHROME_FULL_VERSION} Safari/{SAFARI_WEBKIT_VERSION}"
 )
 
-SEC_CH_UA = '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"'
-SEC_CH_UA_FULL_VERSION_LIST = '"Google Chrome";v="149.0.0.0", "Chromium";v="149.0.0.0", "Not)A;Brand";v="24.0.0.0"'
+SEC_CH_UA = '"Google Chrome";v="124", "Chromium";v="124", "Not)A;Brand";v="24"'
+SEC_CH_UA_FULL_VERSION_LIST = '"Google Chrome";v="124.0.0.0", "Chromium";v="124.0.0.0", "Not)A;Brand";v="24.0.0.0"'
 SEC_CH_UA_PLATFORM = '"macOS"'
 SEC_CH_UA_PLATFORM_VERSION = '"15.7.0"'
 SEC_CH_UA_MOBILE = "?0"
@@ -301,3 +301,17 @@ def validate_browser_profile(profile: dict) -> list[str]:
 
 # ---- .env overrides for WebUI editable fields ----
 apply_env_overrides(globals(), {'BROWSER_LOCALE_PROFILE': 'str', 'AUTO_BROWSER_LOCALE_FROM_IP': 'bool', 'IP_GEO_TIMEOUT': 'float', 'REJECT_CLOUD_PROXY': 'bool'})
+
+# 上面第 147 行那批模块级语言常量是在 apply_env_overrides **之前**算出来的，
+# 那时 BROWSER_LOCALE_PROFILE 还是源码里的硬编码默认值（jp）。结果就是：
+# 无论 .env 怎么改，NAVIGATOR_LANGUAGE / ACCEPT_LANGUAGE / TIMEZONE_* 永远停留在 jp。
+# 它们目前只作 sentinel 的兜底值，但兜底一旦生效就会把整条链路带成日文画像
+# （实测已导致 MFA「Trouble scanning」等英文标签匹配失败）。
+# 这里在覆盖之后重算一次，让 .env 真正生效。
+_LOCALE = BROWSER_LOCALE_PROFILES.get(BROWSER_LOCALE_PROFILE, BROWSER_LOCALE_PROFILES["jp"])
+NAVIGATOR_LANGUAGE = _LOCALE["navigator_language"]
+NAVIGATOR_LANGUAGES = list(_LOCALE["navigator_languages"])
+ACCEPT_LANGUAGE = _LOCALE["accept_language"]
+TIMEZONE_IANA = _LOCALE["timezone_iana"]
+TIMEZONE_OFFSET_MINUTES = int(_LOCALE["timezone_offset_minutes"])
+TIMEZONE_NAME = _LOCALE["timezone_name"]

@@ -182,6 +182,7 @@ def run_registration(
     #   cloak        = CloakBrowser + Playwright/Selenium 适配层
     #   browser_use  = Browser Use Cloud stealth Chromium + Playwright
     #   skyvern      = Skyvern Browser Sessions + Playwright
+    #   chrome       = 本机 Google Chrome + Playwright（零凭证，必须 headful）
     driver_mode = str(getattr(_roxy_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol").strip().lower()
     if driver_mode in ("roxy", "roxybrowser", "fingerprint", "browser"):
         from core.roxy_registration import run_roxy_registration
@@ -196,6 +197,16 @@ def run_registration(
     if driver_mode in ("cloak", "cloakbrowser"):
         from core.cloakbrowser_registration import run_cloak_registration
         return run_cloak_registration(
+            email=email,
+            name=name,
+            birthday=birthday or generate_random_birthday(),
+            proxy=proxy,
+            otp_code=otp_code,
+            batch_dir=batch_dir,
+        )
+    if driver_mode in ("chrome", "localchrome", "local_chrome"):
+        from core.chrome_registration import run_chrome_registration
+        return run_chrome_registration(
             email=email,
             name=name,
             birthday=birthday or generate_random_birthday(),
@@ -225,7 +236,8 @@ def run_registration(
         )
     if driver_mode not in ("protocol", "api", "http"):
         raise RuntimeError(
-            f"不支持的 REGISTRATION_DRIVER={driver_mode!r}，可选 protocol / roxy / cloak / browser_use / skyvern"
+            f"不支持的 REGISTRATION_DRIVER={driver_mode!r}，"
+            f"可选 protocol / roxy / cloak / chrome / browser_use / skyvern"
         )
 
     # 创建浏览器会话（proxy=None 时自动从 config.PROXY_POOL 随机抽一个）
