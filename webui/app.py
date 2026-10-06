@@ -169,7 +169,18 @@ def _job_status_counts(rows: list[dict]) -> dict:
     counts["active"] = sum(int(counts.get(s, 0) or 0) for s in ("pending", "running", "stopping"))
     return counts
 
-def create_app(auth_code: str | None = None) -> Flask:
+def create_app(auth_code: str | None = None, *, recover_interrupted: bool = False) -> Flask:
+    """构造 Flask 应用。
+
+    ``recover_interrupted`` 决定是否执行「进程启动时的中断恢复」——把上次异常退出
+    遗留的 running 任务/状态标记为失败。**默认 False**，因为它会改写生产账本：
+
+      测试里普遍调用 ``create_app()`` 只是为了拿一个 ``test_client``。若顺带执行
+      恢复，就会把**当时正在跑的注册任务**判死（2026-10-06 job 192 即因此被误杀：
+      运行 unittest 时该任务还在 OTP 阶段，却被标记为「WebUI 重启或进程异常退出」）。
+
+    真正的服务启动入口（``web.py``）显式传 ``True``。
+    """
     app = Flask(__name__, template_folder="templates")
     _prepared_downloads: dict[str, dict] = {}
 
@@ -211,21 +222,22 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     init_auth(app, auth_code=auth_code)
     register_auth_routes(app)
-    recovered_plan_checks = db.recover_interrupted_plan_checks()
-    if recovered_plan_checks:
-        logger.warning("已恢复 %s 个因 WebUI 重启中断的套餐查询状态", recovered_plan_checks)
-    recovered_extract_links = db.recover_interrupted_extract_links()
-    if recovered_extract_links:
-        logger.warning("已恢复 %s 个因 WebUI 重启中断的提链状态", recovered_extract_links)
-    recovered_live_checks = db.recover_interrupted_live_checks()
-    if recovered_live_checks:
-        logger.warning("已恢复 %s 个因 WebUI 重启中断的查活状态", recovered_live_checks)
-    recovered_codex_agents = db.recover_interrupted_codex_agents()
-    if recovered_codex_agents:
-        logger.warning("已恢复 %s 个因 WebUI 重启中断的 Codex Agent Token 状态", recovered_codex_agents)
-    recovered_jobs = db.recover_interrupted_jobs()
-    if recovered_jobs:
-        logger.warning("已恢复 %s 个因 WebUI 重启中断的注册任务（已标记为失败，可重试）", recovered_jobs)
+    if recover_interrupted:
+        recovered_plan_checks = db.recover_interrupted_plan_checks()
+        if recovered_plan_checks:
+            logger.warning("已恢复 %s 个因 WebUI 重启中断的套餐查询状态", recovered_plan_checks)
+        recovered_extract_links = db.recover_interrupted_extract_links()
+        if recovered_extract_links:
+            logger.warning("已恢复 %s 个因 WebUI 重启中断的提链状态", recovered_extract_links)
+        recovered_live_checks = db.recover_interrupted_live_checks()
+        if recovered_live_checks:
+            logger.warning("已恢复 %s 个因 WebUI 重启中断的查活状态", recovered_live_checks)
+        recovered_codex_agents = db.recover_interrupted_codex_agents()
+        if recovered_codex_agents:
+            logger.warning("已恢复 %s 个因 WebUI 重启中断的 Codex Agent Token 状态", recovered_codex_agents)
+        recovered_jobs = db.recover_interrupted_jobs()
+        if recovered_jobs:
+            logger.warning("已恢复 %s 个因 WebUI 重启中断的注册任务（已标记为失败，可重试）", recovered_jobs)
 
     # ----------------------------------------------------------
     # 页面

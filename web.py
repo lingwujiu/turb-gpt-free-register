@@ -93,7 +93,10 @@ def main() -> None:
         logger.error(str(exc))
         raise SystemExit(2) from exc
 
-    app = create_app(auth_code=args.auth_code)
+    # recover_interrupted=True：这里是真正的服务启动入口，需要把上次异常退出
+    # 遗留的 running 僵尸记录标记为失败。测试调用 create_app() 时保持默认 False，
+    # 否则会误杀当时正在运行的注册任务。
+    app = create_app(auth_code=args.auth_code, recover_interrupted=True)
     url = f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '::') else args.host}:{args.port}"
     logger.info(f"WebUI 已启动：{url}")
     if is_generated_code():
