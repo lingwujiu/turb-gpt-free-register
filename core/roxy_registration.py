@@ -1165,8 +1165,12 @@ def _submit_email_and_wait_next(driver, email: str, attempts: int = 3) -> str:
                 return probe
             if probe == "blocked":
                 raise _blocked_ip_error(driver)
-        # 邮箱填写可能在页面 SPA 跳转途中执行脚本（context destroyed）。
-        # 此时不直接崩，等页面稳定后重新判定——可能早就进入下一步了。
+        # 邮箱填写失败有两种常见诱因，都不该直接判死：
+        #   1) 页面 SPA 跳转途中执行脚本（context destroyed / navigation）；
+        #   2) 高负载或 OpenAI 前进变慢时，「填邮箱」的重试窗口先到期，而页面其实
+        #      已经悄悄跳到 OTP/密码页（2026-10-07 job 232：错误 state 里 url 已是
+        #      /email-verification、title='Check your inbox'，却报「找不到邮箱输入框」）。
+        # 统一先复核页面真实状态，可能早已进入下一步；否则按次重试。
         try:
             _type_email_address(driver, email, timeout=20)
         except Exception as _exc:
@@ -1174,18 +1178,22 @@ def _submit_email_and_wait_next(driver, email: str, attempts: int = 3) -> str:
             if "Execution context was destroyed" in _msg or "navigation" in _msg.lower():
                 logger.warning("%s 邮箱填写时页面正在导航（context destroyed），重新判定状态", _log_prefix(driver))
                 time.sleep(2.0)
-                _probe = _wait_email_submit_next_state(driver, email, timeout=6)
-                if _probe in ("password", "otp", "logged_in"):
-                    logger.info("%s 重新判定，页面实际已进入下一步：%s", _log_prefix(driver), _probe)
-                    return _probe
-                if _probe == "blocked":
-                    raise _blocked_ip_error(driver)
-                if attempt == attempts:
-                    _dump_stuck_login_page(driver, email, "context_destroyed")
-                    raise RuntimeError(f"邮箱提交后页面卡在登录页（导航中脚本中断），最后状态={_email_input_value_state(driver)}")
-                time.sleep(1.0)
-                continue
-            raise
+            _probe = _wait_email_submit_next_state(driver, email, timeout=6)
+            if _probe in ("password", "otp", "logged_in"):
+                logger.info("%s 邮箱填写异常后重新判定，页面实际已进入下一步：%s（忽略：%s）",
+                            _log_prefix(driver), _probe, _msg[:100])
+                return _probe
+            if _probe == "blocked":
+                raise _blocked_ip_error(driver)
+            if attempt == attempts:
+                _dump_stuck_login_page(driver, email, "type_email_failed")
+                raise RuntimeError(
+                    f"邮箱填写失败且页面未进入下一步（{_msg[:120]}），最后状态={_email_input_value_state(driver)}"
+                )
+            logger.warning("%s 邮箱填写异常，准备重试：attempt=%s/%s err=%s",
+                           _log_prefix(driver), attempt, attempts, _msg[:120])
+            time.sleep(1.0)
+            continue
         state = _email_input_value_state(driver)
         last_state = state
         values = [str(i.get("value") or "") for i in (state.get("inputs") or [])]
