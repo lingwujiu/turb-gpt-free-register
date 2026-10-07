@@ -17,5 +17,17 @@ REGISTER_PASSWORD = ""
 # OpenAI 限制：name_invalid_chars —— 只允许字母和空格
 REGISTER_NAME = ""
 
+# 串行批量注册时，相邻任务「启动」的最小间隔（秒）。0 = 不额外等待（仅靠 workers=1 自然串行）。
+# 用于在当前出口 IP 被 OpenAI 短时频控时，把任务摊开、降低突发特征。
+REGISTER_TASK_STAGGER_SECONDS = 0
+
+# 在上述最小间隔之上叠加的随机抖动上限（秒），避免任务启动时刻过于规律。
+REGISTER_TASK_STAGGER_JITTER_SECONDS = 0
+
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'REGISTER_EMAIL': 'str', 'REGISTER_NAME': 'str'})
+apply_env_overrides(globals(), {
+    'REGISTER_EMAIL': 'str',
+    'REGISTER_NAME': 'str',
+    'REGISTER_TASK_STAGGER_SECONDS': 'int',
+    'REGISTER_TASK_STAGGER_JITTER_SECONDS': 'int',
+})

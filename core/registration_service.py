@@ -10,7 +10,9 @@
     → 创建 5 个任务，丢入线程池，立即返回 [job_dict, ...]
 """
 import logging
+import random
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +40,39 @@ _THREAD_CTX = threading.local()
 
 class StopRequested(RuntimeError):
     """用户手动停止注册任务。"""
+
+
+# ---- 串行节流：保证相邻任务启动间隔不小于配置值 ----
+_STAGGER_LOCK = threading.Lock()
+_last_job_start_ts: float = 0.0
+
+
+def _apply_start_stagger(job_id: int) -> None:
+    """串行节流：让相邻任务的实际启动时刻间隔不小于 REGISTER_TASK_STAGGER_SECONDS。
+
+    仅当配置 > 0 时生效。workers=1 时任务本身已串行，这里额外保证「启动最小间隔」，
+    避免任务快速失败时下一个任务紧贴着启动（短时突发更容易触发 OpenAI 静默丢弃）。
+    """
+    try:
+        from config import register as _reg_cfg
+        interval = float(getattr(_reg_cfg, "REGISTER_TASK_STAGGER_SECONDS", 0) or 0)
+        jitter = float(getattr(_reg_cfg, "REGISTER_TASK_STAGGER_JITTER_SECONDS", 0) or 0)
+    except Exception:
+        return
+    if interval <= 0:
+        return
+    global _last_job_start_ts
+    with _STAGGER_LOCK:
+        now = time.time()
+        wait = (_last_job_start_ts + interval) - now
+        if wait > 0:
+            total = wait + (random.uniform(0, jitter) if jitter > 0 else 0.0)
+            logger.info(
+                "[Job %s] 串行节流：等待 %.1fs 后启动（最小间隔 %.0fs）",
+                job_id, total, interval,
+            )
+            time.sleep(total)
+        _last_job_start_ts = time.time()
 
 
 def _activate_job(job_id: int) -> None:
@@ -317,6 +352,7 @@ def _run_one_job(job_id: int, log_file: str) -> None:
     try:
         with _JobLogContext(log_file):
             from main import run_registration
+            _apply_start_stagger(job_id)
             log_logger.info(f"[Job {job_id}] 开始注册任务")
             email, name, birthday = _prepare_registration_args()
             db.update_job(job_id, email=email)

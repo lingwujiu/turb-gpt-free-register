@@ -1001,6 +1001,51 @@ def _blocked_ip_error(driver) -> RuntimeError:
     )
 
 
+def _dump_stuck_login_page(driver, email: str, state_name: str) -> None:
+    """邮箱提交后卡在登录页时，dump 页面真实状态（URL/标题/可见文本/完整 HTML）到诊断文件。
+
+    用于定位 OpenAI 到底显示了什么（软封锁提示、额外的 Continue 入口、或未触发的跳转）。
+    任何异常都不向上抛，避免影响主流程。
+    """
+    try:
+        data = driver.execute_script(r"""
+            return {
+                'url': location.href,
+                'title': document.title,
+                'text': (document.body ? document.body.innerText : '') || '',
+                'html': document.documentElement.outerHTML || ''
+            };
+        """)
+    except Exception as exc:
+        logger.warning("%s [卡页诊断] 取页面状态失败：%s: %s", _log_prefix(driver), type(exc).__name__, exc)
+        return
+    url = data.get("url", "") or ""
+    title = data.get("title", "") or ""
+    text = (data.get("text") or "").strip()
+    html = data.get("html") or ""
+    # 落盘完整 HTML
+    try:
+        diag_dir = Path(__file__).resolve().parent.parent / "注册日志"
+        diag_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        safe_email = "".join(c if c.isalnum() or c in "._@-" else "_" for c in str(email or "unknown"))
+        html_path = diag_dir / f"diag_login_{safe_email}_{stamp}.html"
+        html_path.write_text(html, encoding="utf-8")
+    except Exception as exc:
+        html_path = f"(写入失败: {exc})"
+    # 日志摘要
+    logger.warning("%s [卡页诊断] state=%s url=%s title=%r", _log_prefix(driver), state_name, url, title)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    keywords = ("error", "verify", "verification", "continue", "check", "email", "code",
+                "try", "again", "too many", "block", "access", "sign", "log", "please",
+                "invalid", "limit", "unable", "not", "robot", "human", "prove")
+    relevant = [ln for ln in lines if any(k in ln.lower() for k in keywords)]
+    sample = relevant if relevant else lines[:30]
+    for ln in sample[:25]:
+        logger.warning("%s [卡页诊断·文本] %s", _log_prefix(driver), ln[:240])
+    logger.warning("%s [卡页诊断] 完整 HTML 已存：%s (长度=%d)", _log_prefix(driver), html_path, len(html))
+
+
 def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
     """邮箱提交后等待进入 password / otp / logged_in；仍停留邮箱页则返回 email_page。
 
@@ -1120,7 +1165,27 @@ def _submit_email_and_wait_next(driver, email: str, attempts: int = 3) -> str:
                 return probe
             if probe == "blocked":
                 raise _blocked_ip_error(driver)
-        _type_email_address(driver, email, timeout=20)
+        # 邮箱填写可能在页面 SPA 跳转途中执行脚本（context destroyed）。
+        # 此时不直接崩，等页面稳定后重新判定——可能早就进入下一步了。
+        try:
+            _type_email_address(driver, email, timeout=20)
+        except Exception as _exc:
+            _msg = str(_exc)
+            if "Execution context was destroyed" in _msg or "navigation" in _msg.lower():
+                logger.warning("%s 邮箱填写时页面正在导航（context destroyed），重新判定状态", _log_prefix(driver))
+                time.sleep(2.0)
+                _probe = _wait_email_submit_next_state(driver, email, timeout=6)
+                if _probe in ("password", "otp", "logged_in"):
+                    logger.info("%s 重新判定，页面实际已进入下一步：%s", _log_prefix(driver), _probe)
+                    return _probe
+                if _probe == "blocked":
+                    raise _blocked_ip_error(driver)
+                if attempt == attempts:
+                    _dump_stuck_login_page(driver, email, "context_destroyed")
+                    raise RuntimeError(f"邮箱提交后页面卡在登录页（导航中脚本中断），最后状态={_email_input_value_state(driver)}")
+                time.sleep(1.0)
+                continue
+            raise
         state = _email_input_value_state(driver)
         last_state = state
         values = [str(i.get("value") or "") for i in (state.get("inputs") or [])]
@@ -1141,6 +1206,9 @@ def _submit_email_and_wait_next(driver, email: str, attempts: int = 3) -> str:
         if state_name == "blocked":
             raise _blocked_ip_error(driver)
         logger.warning("%s 邮箱提交后仍未进入下一步：%s，准备重填重试 state=%s", _log_prefix(driver), state_name, _email_input_value_state(driver))
+        if attempt == attempts:
+            _dump_stuck_login_page(driver, email, state_name)
+            raise RuntimeError(f"邮箱提交后未进入密码页/验证码页，最后状态={_email_input_value_state(driver)}")
         time.sleep(1.0)
     raise RuntimeError(f"邮箱提交后未进入密码页/验证码页，最后状态={last_state}")
 
@@ -1967,6 +2035,40 @@ def _accept_profile_consents(driver) -> int:
         return 0
 
 
+def _recover_from_email_verified_deadend(driver, snap: dict) -> bool:
+    """邮箱已验证、但 SPA 停在 /email-verification 死页时，手动导航到 about-you 续跑。
+
+    背景（2026-10-07 job 206/214/216/219/220/221）：OTP 提交第一次若「点击未生效」会被判
+    stuck，恢复逻辑 refresh 页面；重载后服务端其实已确认邮箱通过，页面停在静态的
+    "Email verified / already been verified" 页（无输入框、无按钮），SPA **不会**自动跳到
+    about-you，于是资料页等待超时、任务被判失败。这里直接导航到下一步路由把流程接回来。
+    """
+    try:
+        url = str((snap or {}).get('url') or '').lower()
+        title = str((snap or {}).get('title') or '').lower()
+        text = str((snap or {}).get('text') or '').lower()
+    except Exception:
+        return False
+    if 'email-verification' not in url:
+        return False
+    if 'email verified' not in title and 'already been verified' not in text:
+        return False
+    try:
+        logger.info(
+            '%s[资料页] 检测到「邮箱已验证」死页（SPA 未跳转），手动导航到 /about-you 续跑',
+            _log_prefix(driver),
+        )
+        driver.get('https://auth.openai.com/about-you')
+        time.sleep(2.5)
+        return True
+    except Exception as exc:
+        logger.warning(
+            '%s[资料页] 导航 /about-you 失败：%s: %s',
+            _log_prefix(driver), type(exc).__name__, str(exc)[:160],
+        )
+        return False
+
+
 def _complete_profile_page(driver, name: str, birthday: str, timeout: int = 45) -> bool:
     """等待并完成姓名/生日页；若已经登录成功则返回 False，不把它当失败。"""
     end = time.time() + timeout
@@ -1975,6 +2077,8 @@ def _complete_profile_page(driver, name: str, birthday: str, timeout: int = 45) 
     today = date.today()
     age = today.year - int(y) - ((today.month, today.day) < (int(m), int(d)))
     last_snapshot = {}
+    deadend_recoveries = 0
+    error_page_recoveries = 0
     while time.time() < end:
         time.sleep(1)
         if _has_access_token(driver):
@@ -1983,6 +2087,25 @@ def _complete_profile_page(driver, name: str, birthday: str, timeout: int = 45) 
         snap = _page_snapshot(driver)
         last_snapshot = snap
         if not _is_profile_like(snap):
+            # ① 邮箱已验证、但 SPA 停在 /email-verification 死页 → 手动导航到 about-you 续跑。
+            if deadend_recoveries < 3 and _recover_from_email_verified_deadend(driver, snap):
+                deadend_recoveries += 1
+                end = time.time() + timeout
+                continue
+            # ② 偶发 Chrome 内置错误页（代理抖动）→ 重载后继续等，别直接判超时。
+            if error_page_recoveries < 2 and _is_chrome_error_page(driver):
+                error_page_recoveries += 1
+                logger.info(
+                    '%s 等待资料页时遇到 Chrome 错误页，重载后继续（第 %s 次）',
+                    _log_prefix(driver), error_page_recoveries,
+                )
+                try:
+                    driver.refresh()
+                except Exception:
+                    pass
+                time.sleep(2)
+                end = time.time() + timeout
+                continue
             logger.info('%s 等待资料页中：url=%s', _log_prefix(driver), snap.get('url'))
             continue
 
